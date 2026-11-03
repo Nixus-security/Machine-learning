@@ -1,4 +1,14 @@
 //! Deep learning : perceptron multicouche (13 -> 32 -> 16 -> 1, ReLU, Adam), from scratch en Rust.
+//!
+//! Optimisations :
+//! - le lot est stocke "par variable" (acts[l][j * n + s] = activation j de l'exemple s) : les boucles
+//!   internes parcourent des exemples contigus en memoire, vectorises en SIMD (AVX2 / AVX-512) ;
+//! - le lot est decoupe en paquets traites en parallele par des threads persistants (1 par coeur),
+//!   synchronises par 2 barrieres par epoch ; les gradients partiels sont sommes avant Adam.
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, RwLock};
+use std::thread;
 
 use ml_models::{record, run, Lcg, Model, Snap, SEED};
 
@@ -22,19 +32,54 @@ fn zeros(sizes: impl Iterator<Item = usize>) -> Vec<Vec<f64>> {
     sizes.map(|k| vec![0.0; k]).collect()
 }
 
+/// Produit scalaire a 8 accumulateurs independants : vectorisable sans changer de precision.
+fn dot(a: &[f64], b: &[f64]) -> f64 {
+    let (ca, cb) = (a.chunks_exact(8), b.chunks_exact(8));
+    let tail: f64 = ca.remainder().iter().zip(cb.remainder()).map(|(x, y)| x * y).sum();
+    let mut acc = [0.0; 8];
+    for (x, y) in ca.zip(cb) {
+        for k in 0..8 {
+            acc[k] += x[k] * y[k];
+        }
+    }
+    acc.iter().sum::<f64>() + tail
+}
+
+/// y[r][s] = init(r) + somme_k m(r, k) * a[k][s] (lignes de longueur n).
+/// Calcul par blocs de 8 exemples : l'accumulateur reste en registre SIMD.
+fn matmul(y: &mut [f64], a: &[f64], n: usize, init: impl Fn(usize) -> f64, m: impl Fn(usize, usize) -> f64) {
+    const B: usize = 8;
+    for (r, yr) in y.chunks_exact_mut(n).enumerate() {
+        for s in (0..n).step_by(B) {
+            let mut acc = [init(r); B];
+            if s + B <= n {
+                for (k, ak) in a.chunks_exact(n).enumerate() {
+                    let (w, ak): (f64, &[f64; B]) = (m(r, k), ak[s..s + B].try_into().unwrap());
+                    for t in 0..B {
+                        acc[t] += w * ak[t];
+                    }
+                }
+            } else {
+                for (k, ak) in a.chunks_exact(n).enumerate() {
+                    let w = m(r, k);
+                    acc.iter_mut().zip(&ak[s..]).for_each(|(c, a)| *c += w * a);
+                }
+            }
+            let len = B.min(n - s);
+            yr[s..s + len].copy_from_slice(&acc[..len]);
+        }
+    }
+}
+
 impl Mlp {
-    /// Remplit `acts` (une entree par couche, entree incluse) sans allocation.
-    fn forward(&self, x: &[f64], acts: &mut [Vec<f64>]) {
-        acts[0].copy_from_slice(x);
+    /// Propagation avant d'un lot de n exemples ; acts[0] contient deja l'entree.
+    fn forward(&self, n: usize, acts: &mut [Vec<f64>]) {
         for l in 0..self.w.len() {
             let (prev, next) = acts.split_at_mut(l + 1);
-            let z = &mut next[0];
-            z.copy_from_slice(&self.b[l]);
-            for (a, row) in prev[l].iter().zip(self.w[l].chunks_exact(z.len())) {
-                z.iter_mut().zip(row).for_each(|(zo, wo)| *zo += a * wo);
-            }
+            let (w, b, out) = (&self.w[l], &self.b[l], self.b[l].len());
+            matmul(&mut next[0], &prev[l], n, |o| b[o], |o, i| w[i * out + o]);
             if l < self.w.len() - 1 {
-                z.iter_mut().for_each(|v| *v = v.max(0.0)); // ReLU
+                next[0].iter_mut().for_each(|v| *v = v.max(0.0)); // ReLU
             }
         }
     }
@@ -43,11 +88,96 @@ impl Mlp {
 impl Model for Mlp {
     fn predict(&self, x: &[f64]) -> f64 {
         let mut acts = zeros(LAYERS.into_iter());
-        self.forward(x, &mut acts);
+        acts[0].copy_from_slice(x);
+        self.forward(1, &mut acts);
         acts[LAYERS.len() - 1][0] * self.y_std + self.y_mean
     }
     fn history(&self) -> &[f64] {
         &self.history
+    }
+}
+
+/// Barriere a attente active : latence de l'ordre de la microseconde, la ou `std::sync::Barrier`
+/// (endormissement / reveil des threads) couterait plus qu'une epoch entiere.
+/// Si l'attente se prolonge (CPU sature), cede le coeur pour ne pas bloquer les autres threads.
+struct SpinBarrier {
+    n: usize,
+    count: AtomicUsize,
+    generation: AtomicUsize,
+}
+
+impl SpinBarrier {
+    fn new(n: usize) -> Self {
+        SpinBarrier { n, count: AtomicUsize::new(0), generation: AtomicUsize::new(0) }
+    }
+    fn wait(&self) {
+        let generation = self.generation.load(Ordering::Acquire);
+        if self.count.fetch_add(1, Ordering::AcqRel) + 1 == self.n {
+            self.count.store(0, Ordering::Relaxed);
+            self.generation.fetch_add(1, Ordering::Release);
+        } else {
+            let mut spins = 0u32;
+            while self.generation.load(Ordering::Acquire) == generation {
+                spins += 1;
+                if spins < 20_000 {
+                    std::hint::spin_loop();
+                } else {
+                    thread::yield_now();
+                }
+            }
+        }
+    }
+}
+
+/// Paquet d'exemples traite par un thread, avec ses buffers alloues une seule fois.
+struct Shard {
+    n: usize,
+    ys: Vec<f64>,
+    acts: Vec<Vec<f64>>,
+    deltas: Vec<Vec<f64>>,
+    grads: Vec<Vec<f64>>, // poids puis biais, meme ordre que les moments Adam
+    sse: f64,
+}
+
+impl Shard {
+    fn new(x: &[Vec<f64>], ys: &[f64], grad_sizes: impl Iterator<Item = usize>) -> Self {
+        let n = ys.len();
+        let mut acts = zeros(LAYERS.iter().map(|k| k * n));
+        for (j, col) in acts[0].chunks_exact_mut(n).enumerate() {
+            col.iter_mut().zip(x).for_each(|(c, row)| *c = row[j]);
+        }
+        let deltas = zeros(LAYERS[1..].iter().map(|k| k * n));
+        Shard { n, ys: ys.to_vec(), acts, deltas, grads: zeros(grad_sizes), sse: 0.0 }
+    }
+
+    /// Gradients partiels de la MSE (normalisee par n_total) sur ce paquet.
+    fn backprop(&mut self, model: &Mlp, n_total: f64) {
+        let (n, last) = (self.n, model.w.len() - 1);
+        model.forward(n, &mut self.acts);
+        self.sse = 0.0;
+        for ((d, out), t) in self.deltas[last].iter_mut().zip(&self.acts[last + 1]).zip(&self.ys) {
+            let err = out - t;
+            self.sse += err * err;
+            *d = 2.0 / n_total * err;
+        }
+        let (gw, gb) = self.grads.split_at_mut(model.w.len());
+        for l in (0..=last).rev() {
+            // retropropagation : gradients de la couche l, puis delta de la couche precedente
+            let (lo, hi) = self.deltas.split_at_mut(l);
+            let (d, w, out) = (&hi[0], &model.w[l], model.b[l].len());
+            for (i, a) in self.acts[l].chunks_exact(n).enumerate() {
+                for (o, dv) in d.chunks_exact(n).enumerate() {
+                    gw[l][i * out + o] = dot(a, dv);
+                }
+            }
+            for (g, dv) in gb[l].iter_mut().zip(d.chunks_exact(n)) {
+                *g = dv.iter().sum();
+            }
+            if l > 0 {
+                matmul(&mut lo[l - 1], d, n, |_| 0.0, |i, o| w[i * out + o]);
+                lo[l - 1].iter_mut().zip(&self.acts[l]).for_each(|(p, a)| if *a <= 0.0 { *p = 0.0 });
+            }
+        }
     }
 }
 
@@ -56,67 +186,66 @@ fn fit(x: &[Vec<f64>], y: &[f64], mut snap: Snap) -> Mlp {
     let mut rng = Lcg::new(SEED + 2);
     // Init He uniforme, meme sequence aleatoire que la version Python
     let w = pairs.iter().map(|&(i, o)| (0..i * o).map(|_| rng.uniform() * (6.0 / i as f64).sqrt()).collect()).collect();
-    let n = y.len() as f64;
-    let y_mean = y.iter().sum::<f64>() / n;
-    let y_std = (y.iter().map(|v| (v - y_mean).powi(2)).sum::<f64>() / n).sqrt(); // cible standardisee
-    let mut model = Mlp { w, b: zeros(LAYERS[1..].iter().copied()), y_mean, y_std, history: Vec::with_capacity(EPOCHS) };
+    let nf = y.len() as f64;
+    let y_mean = y.iter().sum::<f64>() / nf;
+    let y_std = (y.iter().map(|v| (v - y_mean).powi(2)).sum::<f64>() / nf).sqrt(); // cible standardisee
+    let ys: Vec<f64> = y.iter().map(|v| (v - y_mean) / y_std).collect();
+    let model = RwLock::new(Mlp { w, b: zeros(LAYERS[1..].iter().copied()), y_mean, y_std, history: Vec::with_capacity(EPOCHS) });
 
-    // Buffers alloues une seule fois : gradients, moments Adam (poids puis biais), activations, deltas
+    // 1 paquet par coeur (taille multiple de 8 pour le SIMD)
     let sizes = || pairs.iter().map(|&(i, o)| i * o).chain(LAYERS[1..].iter().copied());
+    let cores = std::env::var("ML_THREADS").ok().and_then(|c| c.parse().ok()) // limite optionnelle (test en direct)
+        .unwrap_or_else(|| thread::available_parallelism().map_or(1, |c| c.get()))
+        .max(1);
+    let chunk = y.len().div_ceil(cores).next_multiple_of(8);
+    let shards: Vec<Mutex<Shard>> =
+        x.chunks(chunk).zip(ys.chunks(chunk)).map(|(xc, yc)| Mutex::new(Shard::new(xc, yc, sizes()))).collect();
+    let (start, done) = (SpinBarrier::new(shards.len()), SpinBarrier::new(shards.len()));
     let (mut grads, mut m, mut v) = (zeros(sizes()), zeros(sizes()), zeros(sizes()));
-    let mut wt = zeros(pairs.iter().map(|&(i, o)| i * o)); // poids transposes (out x in)
-    let mut acts = zeros(LAYERS.into_iter());
-    let mut deltas = zeros(LAYERS[1..].iter().copied());
-    let last = pairs.len() - 1;
 
-    for epoch in 0..EPOCHS {
-        record(&mut snap, epoch, EPOCHS, &model);
-        grads.iter_mut().for_each(|g| g.fill(0.0));
-        for (l, &(i_n, o_n)) in pairs.iter().enumerate() {
-            for i in 0..i_n {
-                for o in 0..o_n {
-                    wt[l][o * i_n + i] = model.w[l][i * o_n + o];
+    thread::scope(|scope| {
+        for shard in &shards[1..] {
+            let (model, start, done) = (&model, &start, &done);
+            scope.spawn(move || {
+                for _ in 0..EPOCHS {
+                    start.wait();
+                    shard.lock().unwrap().backprop(&model.read().unwrap(), nf);
+                    done.wait();
                 }
-            }
+            });
         }
-        let mut sse = 0.0;
-        for (xi, yi) in x.iter().zip(y) {
-            model.forward(xi, &mut acts);
-            let err = acts[last + 1][0] - (yi - y_mean) / y_std;
-            sse += err * err;
-            deltas[last][0] = 2.0 / n * err;
-            for l in (0..=last).rev() {
-                // retropropagation : gradient de la couche l, puis delta de la couche precedente
-                let (lo, hi) = deltas.split_at_mut(l);
-                let (d, (gw, gb)) = (&hi[0], grads.split_at_mut(pairs.len()));
-                for (a, row) in acts[l].iter().zip(gw[l].chunks_exact_mut(d.len())) {
-                    row.iter_mut().zip(d).for_each(|(g, dv)| *g += a * dv);
-                }
-                gb[l].iter_mut().zip(d).for_each(|(g, dv)| *g += dv);
-                if l > 0 {
-                    let prev = &mut lo[l - 1];
-                    prev.fill(0.0);
-                    for (dv, col) in d.iter().zip(wt[l].chunks_exact(prev.len())) {
-                        prev.iter_mut().zip(col).for_each(|(p, w)| *p += dv * w);
-                    }
-                    prev.iter_mut().zip(&acts[l]).for_each(|(p, a)| if *a <= 0.0 { *p = 0.0 });
-                }
-            }
-        }
-        model.history.push(sse / n * y_std * y_std);
+        for epoch in 0..EPOCHS {
+            record(&mut snap, epoch, EPOCHS, &*model.read().unwrap());
+            start.wait();
+            shards[0].lock().unwrap().backprop(&model.read().unwrap(), nf);
+            done.wait();
 
-        // Adam
-        let t = (epoch + 1) as i32;
-        let (c1, c2) = (1.0 - BETA1.powi(t), 1.0 - BETA2.powi(t));
-        let params = model.w.iter_mut().chain(model.b.iter_mut());
-        for (((p, g), m), v) in params.zip(&grads).zip(&mut m).zip(&mut v) {
-            for k in 0..p.len() {
-                m[k] = BETA1 * m[k] + (1.0 - BETA1) * g[k];
-                v[k] = BETA2 * v[k] + (1.0 - BETA2) * g[k] * g[k];
-                p[k] -= LEARNING_RATE * (m[k] / c1) / ((v[k] / c2).sqrt() + EPS);
+            let mut model = model.write().unwrap();
+            grads.iter_mut().for_each(|g| g.fill(0.0));
+            let mut sse = 0.0;
+            for shard in &shards {
+                let shard = shard.lock().unwrap();
+                sse += shard.sse;
+                for (g, sg) in grads.iter_mut().zip(&shard.grads) {
+                    g.iter_mut().zip(sg).for_each(|(g, s)| *g += s);
+                }
+            }
+            model.history.push(sse / nf * y_std * y_std);
+
+            // Adam
+            let t = (epoch + 1) as i32;
+            let (c1, c2) = (1.0 - BETA1.powi(t), 1.0 - BETA2.powi(t));
+            let Mlp { w, b, .. } = &mut *model;
+            for (((p, g), m), v) in w.iter_mut().chain(b.iter_mut()).zip(&grads).zip(&mut m).zip(&mut v) {
+                for (((p, g), m), v) in p.iter_mut().zip(g).zip(m.iter_mut()).zip(v.iter_mut()) {
+                    *m = BETA1 * *m + (1.0 - BETA1) * g;
+                    *v = BETA2 * *v + (1.0 - BETA2) * g * g;
+                    *p -= LEARNING_RATE * (*m / c1) / ((*v / c2).sqrt() + EPS);
+                }
             }
         }
-    }
+    });
+    let model = model.into_inner().unwrap();
     record(&mut snap, EPOCHS, EPOCHS, &model);
     model
 }

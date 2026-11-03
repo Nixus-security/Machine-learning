@@ -2,6 +2,7 @@
 import csv
 import json
 import statistics
+import sys
 import time
 from pathlib import Path
 
@@ -69,6 +70,30 @@ def metrics(y, pred):
     return float(rmse), float(r2)
 
 
+def bench(seconds, fit):
+    """Test de charge : entraine en boucle pendant `seconds` s et ecrit une ligne JSON toutes les ~50 ms
+    (epochs cumulees, entrainements termines, MSE courante) pour l'interface en direct."""
+    start = time.perf_counter()
+    ms = lambda: (time.perf_counter() - start) * 1000
+    emit = lambda: print(json.dumps({"t": ms(), "epochs": s["done"] + s["prev"], "runs": s["runs"], "loss": s["loss"]}),
+                         flush=True)
+    s = {"done": 0, "prev": 0, "runs": 0, "loss": 0.0, "last": -1e9}
+
+    def progress(epoch, model):
+        if epoch < s["prev"]:  # nouvel entrainement : le precedent est termine
+            s["done"] += s["prev"]
+            s["runs"] += 1
+        s["prev"], s["loss"] = epoch, model.history[-1] if model.history else s["loss"]
+        if ms() - s["last"] >= 50:
+            s["last"] = ms()
+            emit()
+
+    while ms() < seconds * 1000:
+        fit(progress)
+    s["runs"] += 1
+    emit()
+
+
 def run(name, fit, extra=lambda model: {}):
     """fit(X, y, snap) -> modele avec .predict(X) et .history ; snap(epoch, model) enregistre l'etat."""
     X, y = load_data()
@@ -77,6 +102,8 @@ def run(name, fit, extra=lambda model: {}):
     test, train = idx[:n_test], idx[n_test:]
     # Standardisation calculee uniquement sur le jeu d'entrainement
     Xs = (X - X[train].mean(axis=0)) / X[train].std(axis=0)
+    if "--bench" in sys.argv:
+        return bench(float(sys.argv[sys.argv.index("--bench") + 1]), lambda snap: fit(Xs[train], y[train], snap))
 
     snapshots = []
     snap = lambda epoch, m: snapshots.append(
