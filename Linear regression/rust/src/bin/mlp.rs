@@ -1,8 +1,7 @@
 //! Deep learning : perceptron multicouche (13 -> 32 -> 16 -> 1, ReLU, Adam), from scratch en Rust.
 //!
 //! Optimisations :
-//! - le lot est stocke "par variable" (acts[l][j * n + s] = activation j de l'exemple s) : les boucles
-//!   internes parcourent des exemples contigus en memoire, vectorises en SIMD (AVX2 / AVX-512) ;
+//! - le lot est stocke "par variable" et calcule par les noyaux SIMD a tuiles de `ml_models::simd` ;
 //! - le lot est decoupe en paquets traites en parallele par des threads persistants (1 par coeur),
 //!   synchronises par 2 barrieres par epoch ; les gradients partiels sont sommes avant Adam.
 
@@ -10,6 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, RwLock};
 use std::thread;
 
+use ml_models::simd::{grad, matmul, sum, to_columns, LANES};
 use ml_models::{record, run, Lcg, Model, Snap, SEED};
 
 const LAYERS: [usize; 4] = [13, 32, 16, 1];
@@ -32,45 +32,6 @@ fn zeros(sizes: impl Iterator<Item = usize>) -> Vec<Vec<f64>> {
     sizes.map(|k| vec![0.0; k]).collect()
 }
 
-/// Produit scalaire a 8 accumulateurs independants : vectorisable sans changer de precision.
-fn dot(a: &[f64], b: &[f64]) -> f64 {
-    let (ca, cb) = (a.chunks_exact(8), b.chunks_exact(8));
-    let tail: f64 = ca.remainder().iter().zip(cb.remainder()).map(|(x, y)| x * y).sum();
-    let mut acc = [0.0; 8];
-    for (x, y) in ca.zip(cb) {
-        for k in 0..8 {
-            acc[k] += x[k] * y[k];
-        }
-    }
-    acc.iter().sum::<f64>() + tail
-}
-
-/// y[r][s] = init(r) + somme_k m(r, k) * a[k][s] (lignes de longueur n).
-/// Calcul par blocs de 8 exemples : l'accumulateur reste en registre SIMD.
-fn matmul(y: &mut [f64], a: &[f64], n: usize, init: impl Fn(usize) -> f64, m: impl Fn(usize, usize) -> f64) {
-    const B: usize = 8;
-    for (r, yr) in y.chunks_exact_mut(n).enumerate() {
-        for s in (0..n).step_by(B) {
-            let mut acc = [init(r); B];
-            if s + B <= n {
-                for (k, ak) in a.chunks_exact(n).enumerate() {
-                    let (w, ak): (f64, &[f64; B]) = (m(r, k), ak[s..s + B].try_into().unwrap());
-                    for t in 0..B {
-                        acc[t] += w * ak[t];
-                    }
-                }
-            } else {
-                for (k, ak) in a.chunks_exact(n).enumerate() {
-                    let w = m(r, k);
-                    acc.iter_mut().zip(&ak[s..]).for_each(|(c, a)| *c += w * a);
-                }
-            }
-            let len = B.min(n - s);
-            yr[s..s + len].copy_from_slice(&acc[..len]);
-        }
-    }
-}
-
 impl Mlp {
     /// Propagation avant d'un lot de n exemples ; acts[0] contient deja l'entree.
     fn forward(&self, n: usize, acts: &mut [Vec<f64>]) {
@@ -87,9 +48,9 @@ impl Mlp {
 
 impl Model for Mlp {
     fn predict(&self, x: &[f64]) -> f64 {
-        let mut acts = zeros(LAYERS.into_iter());
-        acts[0].copy_from_slice(x);
-        self.forward(1, &mut acts);
+        let mut acts = zeros(LAYERS.iter().map(|k| k * LANES)); // 1 exemple + remplissage SIMD
+        x.iter().enumerate().for_each(|(j, v)| acts[0][j * LANES] = *v);
+        self.forward(LANES, &mut acts);
         acts[LAYERS.len() - 1][0] * self.y_std + self.y_mean
     }
     fn history(&self) -> &[f64] {
@@ -131,7 +92,7 @@ impl SpinBarrier {
 
 /// Paquet d'exemples traite par un thread, avec ses buffers alloues une seule fois.
 struct Shard {
-    n: usize,
+    n: usize, // nombre d'exemples arrondi au multiple de LANES (remplissage : delta nul)
     ys: Vec<f64>,
     acts: Vec<Vec<f64>>,
     deltas: Vec<Vec<f64>>,
@@ -141,11 +102,9 @@ struct Shard {
 
 impl Shard {
     fn new(x: &[Vec<f64>], ys: &[f64], grad_sizes: impl Iterator<Item = usize>) -> Self {
-        let n = ys.len();
+        let (cols, n) = to_columns(x);
         let mut acts = zeros(LAYERS.iter().map(|k| k * n));
-        for (j, col) in acts[0].chunks_exact_mut(n).enumerate() {
-            col.iter_mut().zip(x).for_each(|(c, row)| *c = row[j]);
-        }
+        acts[0] = cols;
         let deltas = zeros(LAYERS[1..].iter().map(|k| k * n));
         Shard { n, ys: ys.to_vec(), acts, deltas, grads: zeros(grad_sizes), sse: 0.0 }
     }
@@ -165,13 +124,9 @@ impl Shard {
             // retropropagation : gradients de la couche l, puis delta de la couche precedente
             let (lo, hi) = self.deltas.split_at_mut(l);
             let (d, w, out) = (&hi[0], &model.w[l], model.b[l].len());
-            for (i, a) in self.acts[l].chunks_exact(n).enumerate() {
-                for (o, dv) in d.chunks_exact(n).enumerate() {
-                    gw[l][i * out + o] = dot(a, dv);
-                }
-            }
+            grad(&mut gw[l], &self.acts[l], d, n);
             for (g, dv) in gb[l].iter_mut().zip(d.chunks_exact(n)) {
-                *g = dv.iter().sum();
+                *g = sum(dv);
             }
             if l > 0 {
                 matmul(&mut lo[l - 1], d, n, |_| 0.0, |i, o| w[i * out + o]);
@@ -192,12 +147,12 @@ fn fit(x: &[Vec<f64>], y: &[f64], mut snap: Snap) -> Mlp {
     let ys: Vec<f64> = y.iter().map(|v| (v - y_mean) / y_std).collect();
     let model = RwLock::new(Mlp { w, b: zeros(LAYERS[1..].iter().copied()), y_mean, y_std, history: Vec::with_capacity(EPOCHS) });
 
-    // 1 paquet par coeur (taille multiple de 8 pour le SIMD)
+    // 1 paquet par coeur (taille multiple de LANES pour le SIMD)
     let sizes = || pairs.iter().map(|&(i, o)| i * o).chain(LAYERS[1..].iter().copied());
     let cores = std::env::var("ML_THREADS").ok().and_then(|c| c.parse().ok()) // limite optionnelle (test en direct)
         .unwrap_or_else(|| thread::available_parallelism().map_or(1, |c| c.get()))
         .max(1);
-    let chunk = y.len().div_ceil(cores).next_multiple_of(8);
+    let chunk = y.len().div_ceil(cores).next_multiple_of(LANES);
     let shards: Vec<Mutex<Shard>> =
         x.chunks(chunk).zip(ys.chunks(chunk)).map(|(xc, yc)| Mutex::new(Shard::new(xc, yc, sizes()))).collect();
     let (start, done) = (SpinBarrier::new(shards.len()), SpinBarrier::new(shards.len()));
@@ -234,13 +189,13 @@ fn fit(x: &[Vec<f64>], y: &[f64], mut snap: Snap) -> Mlp {
 
             // Adam
             let t = (epoch + 1) as i32;
-            let (c1, c2) = (1.0 - BETA1.powi(t), 1.0 - BETA2.powi(t));
+            let (step, inv_c2) = (LEARNING_RATE / (1.0 - BETA1.powi(t)), 1.0 / (1.0 - BETA2.powi(t)));
             let Mlp { w, b, .. } = &mut *model;
             for (((p, g), m), v) in w.iter_mut().chain(b.iter_mut()).zip(&grads).zip(&mut m).zip(&mut v) {
                 for (((p, g), m), v) in p.iter_mut().zip(g).zip(m.iter_mut()).zip(v.iter_mut()) {
                     *m = BETA1 * *m + (1.0 - BETA1) * g;
                     *v = BETA2 * *v + (1.0 - BETA2) * g * g;
-                    *p -= LEARNING_RATE * (*m / c1) / ((*v / c2).sqrt() + EPS);
+                    *p -= step * *m / ((*v * inv_c2).sqrt() + EPS);
                 }
             }
         }

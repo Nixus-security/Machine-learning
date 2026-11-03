@@ -1,6 +1,8 @@
 //! Briques partagees par les modeles Rust : donnees, split, metriques, benchmark, export JSON.
 //! Aucune dependance externe : uniquement la bibliotheque standard.
 
+pub mod simd;
+
 use std::error::Error;
 use std::fs;
 use std::time::Instant;
