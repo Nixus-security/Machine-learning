@@ -1,0 +1,3 @@
+# Instructions SIMD du CPU local (AVX2...), comme le fait OpenBLAS cote NumPy
+[build]
+rustflags = ["-C", "target-cpu=native"]
