@@ -12,7 +12,7 @@ Temps d'entraînement médian sur 5 exécutions, sur une VM cloud à 4 vCPU (Xeo
 |---|---|---|---|---|
 | Régression linéaire | 66 ms | 5–8 ms | ×8 à ×13 | 0,634 |
 | Descente de gradient stochastique | 74 ms | 0,6 ms | ×120 | 0,607 |
-| Réseau de neurones | 182 ms | 52 ms | ×3,5 | 0,831 |
+| Réseau de neurones | 150–180 ms | 35–45 ms | ×4 | 0,831 |
 
 L'écart est le plus grand quand Python exécute beaucoup de petites opérations (mini-batchs de 16 exemples) : chaque appel NumPy a un coût fixe que Rust n'a pas. Sur le réseau de neurones, NumPy délègue les produits matriciels à OpenBLAS, une bibliothèque C/Fortran très optimisée, d'où un écart plus faible.
 
@@ -24,7 +24,7 @@ L'écart est le plus grand quand Python exécute beaucoup de petites opérations
 | Gradient stochastique (SGD) | `python/sgd.py`, `rust/src/bin/sgd.rs` | Mini-batchs de 16, momentum 0,9, 300 epochs, taux 0,01 |
 | Réseau de neurones (MLP) | `python/mlp.py`, `rust/src/bin/mlp.rs` | 13 → 32 → 16 → 1, ReLU, Adam, 1 000 epochs, taux 0,001 |
 
-Les données viennent de `data/Automobile_data.csv` : 159 voitures complètes, 13 variables numériques (cylindrée, puissance, poids…) et le prix comme cible. Le split est 80 % entraînement / 20 % test. Les variables sont standardisées avec les statistiques du jeu d'entraînement.
+Les données viennent de `data/Automobile_data.csv` : 195 voitures complètes, 13 variables numériques (cylindrée, puissance, poids…) et le prix comme cible. Le split est 80 % entraînement / 20 % test. Les variables sont standardisées avec les statistiques du jeu d'entraînement.
 
 Une **epoch** est un passage complet sur les données d'entraînement. L'unité **ep/s** (epochs par seconde) mesure donc la vitesse d'apprentissage.
 
@@ -64,7 +64,8 @@ cd rust && cargo run --release --bin mlp
 
 - une synthèse des accélérations et un tableau comparatif ;
 - la relecture de l'entraînement epoch par epoch (prix réel vs prédit, courbe d'erreur) ;
-- les temps de chaque exécution, et les poids appris ou l'architecture du réseau.
+- les temps de chaque exécution, et les poids appris ou l'architecture du réseau ;
+- le **réseau de neurones en 3D** : ses 62 neurones et 944 connexions, colorés par signe et amplitude des poids, rejoués au fil de l'entraînement ; on choisit une voiture du jeu de test pour voir les neurones s'activer et la prédiction converger.
 
 Le thème clair ou sombre suit celui du système.
 
@@ -79,7 +80,7 @@ Le thème clair ou sombre suit celui du système.
 - **Données « par variable »** : les lots sont stockés par colonne (`rust/src/simd.rs`), si bien que chaque boucle interne traite 8 exemples contigus en une instruction.
 - **Noyaux à tuiles** : les produits matriciels et les gradients gardent leurs accumulateurs en registres et parcourent la mémoire dans l'ordre favorable au cache.
 - **Zéro allocation dans la boucle d'entraînement** : tous les buffers sont alloués une seule fois.
-- **Multithreading** (réseau de neurones) : le lot est réparti sur les cœurs. Les threads persistants sont synchronisés par une barrière à attente active. Les gradients partiels sont sommés avant la mise à jour Adam. `ML_THREADS` limite le nombre de threads.
+- **Multithreading** (réseau de neurones) : le lot est réparti sur les cœurs. Chaque thread persistant garde sa copie des poids, additionne les gradients publiés par tous les threads et applique Adam lui-même. Le calcul étant identique partout, les poids restent identiques. Il n'y a qu'une barrière (à attente active) par epoch, grâce à un double tampon de gradients, et aucune phase séquentielle. `ML_THREADS` limite le nombre de threads.
 
 ## Méthodologie
 
