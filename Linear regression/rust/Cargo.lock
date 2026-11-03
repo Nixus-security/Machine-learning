@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "linear_regression"
+name = "ml_models"
 version = "0.1.0"
