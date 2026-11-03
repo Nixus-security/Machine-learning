@@ -7,6 +7,8 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
 <style>
   :root {
     --bg: #f7f7f5; --surface: #ffffff; --line: #e6e6e2; --text: #1c1c1a; --muted: #6b6b66; --faint: #a3a39e;
@@ -71,6 +73,11 @@
   .chart { position: relative; height: 300px; }
   .arch { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; color: var(--muted); font-size: 13px; }
   .arch span { border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; color: var(--text); }
+  .net-wrap { position: relative; height: clamp(300px, 60vw, 520px); margin: 0 -24px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+  .net-wrap canvas { display: block; width: 100%; height: 100%; cursor: grab; }
+  #n-car { min-width: 0; max-width: 45%; }
+  .net-legend { display: flex; flex-wrap: wrap; gap: 8px 20px; color: var(--muted); font-size: 12px; margin-top: 16px; }
+  .net-legend i { display: inline-block; width: 18px; height: 3px; border-radius: 2px; vertical-align: middle; margin-right: 6px; }
   .method { margin-top: 48px; padding-top: 24px; border-top: 1px solid var(--line); color: var(--muted); font-size: 13px; }
   .method ul { margin: 8px 0 0; padding-left: 18px; }
 </style>
@@ -135,10 +142,35 @@
     </div>
   </section>
 
+  <section>
+    <h2>Réseau de neurones en 3D</h2>
+    <p class="sub">Les 62 neurones et 944 connexions du modèle, rejoués au fil de l'entraînement. Choisissez une voiture du jeu de test pour suivre son passage dans le réseau.</p>
+    <div class="card">
+      <div class="stats num" style="border:0;padding-bottom:12px">
+        <div><span class="label">Epoch</span><span class="val" id="n-epoch">0</span></div>
+        <div><span class="label">Prix réel</span><span class="val" id="n-real">–</span></div>
+        <div><span class="label">Prix prédit par le réseau</span><span class="val" id="n-pred">–</span></div>
+        <div><span class="label">Écart</span><span class="val" id="n-err">–</span></div>
+      </div>
+      <div class="player" style="margin-top:0">
+        <button class="btn" id="n-play">Pause</button>
+        <input type="range" id="n-scrub" min="0" value="0" aria-label="Epoch affichée">
+        <select id="n-car" aria-label="Voiture du jeu de test"></select>
+      </div>
+      <div class="net-wrap" id="net3d"></div>
+      <div class="net-legend">
+        <span><i style="background:var(--py)"></i>Poids / activation positifs</span>
+        <span><i style="background:var(--rs)"></i>Poids / activation négatifs</span>
+        <span>Intensité = amplitude (normalisée par couche)</span>
+        <span>Glisser pour tourner, molette pour zoomer</span>
+      </div>
+    </div>
+  </section>
+
   <div class="method">
     <strong>Méthodologie</strong>
     <ul>
-      <li>Données : 159 voitures complètes, 13 variables numériques standardisées, split 80 / 20 identique (générateur LCG commun).</li>
+      <li>Données : 195 voitures complètes, 13 variables numériques standardisées, split 80 / 20 identique (générateur LCG commun).</li>
       <li>Python : NumPy vectorisé (OpenBLAS). Rust : bibliothèque standard uniquement, compilé en <code>--release</code> ; le réseau de neurones exploite le SIMD et tous les cœurs (threads).</li>
       <li>Test en direct (3D) : <code>python live.py</code>, les deux langages s'entraînent en parallèle sur 1 cœur chacun.</li>
       <li>Le temps mesuré exclut l'enregistrement des états utilisés pour l'animation.</li>
@@ -301,6 +333,113 @@ scrub.oninput = () => { setPlaying(false); frame = +scrub.value; render(); };
 setModel('linear');
 render();
 requestAnimationFrame(t => { last = t; requestAnimationFrame(tick); });
+
+// ---------- Réseau de neurones en 3D ----------
+(function netViewer() {
+  const R = DATA.mlp.rust, net = R.net, el = $id('net3d');
+  if (!net || !window.THREE) return;
+  const layers = R.layers, frames = net.frames, X = R.test.x;
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  renderer.setClearColor(css('--surface'));
+  el.appendChild(renderer.domElement);
+  const scene = new THREE.Scene(), camera = new THREE.PerspectiveCamera(38, 1, 0.1, 200);
+  camera.position.set(-5, 4, 24);
+  const controls = new THREE.OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true; controls.autoRotate = true; controls.autoRotateSpeed = 0.6;
+  scene.add(new THREE.AmbientLight(0xffffff, 0.8));
+  const sun = new THREE.DirectionalLight(0xffffff, 0.5); sun.position.set(-5, 10, 12); scene.add(sun);
+
+  // Positions : entrées en colonne (avec leur nom), couches cachées en grille, sortie seule
+  const pos = layers.map((count, l) => {
+    const x = (l - (layers.length - 1) / 2) * 7.5;
+    const cols = l === 0 || count === 1 ? 1 : Math.ceil(Math.sqrt(count / 2));
+    const rows = Math.ceil(count / cols);
+    return Array.from({ length: count }, (_, k) => new THREE.Vector3(x, ((rows - 1) / 2 - k % rows) * 0.85, (Math.floor(k / rows) - (cols - 1) / 2) * 1.1));
+  });
+  const all = pos.flat();
+  const nodes = new THREE.InstancedMesh(new THREE.SphereGeometry(0.2, 18, 12), new THREE.MeshLambertMaterial(), all.length);
+  const m4 = new THREE.Matrix4();
+  all.forEach((p, i) => { nodes.setMatrixAt(i, m4.makeTranslation(p.x, p.y, p.z)); nodes.setColorAt(i, new THREE.Color()); });
+  scene.add(nodes);
+
+  const seg = [];
+  for (let l = 0; l < layers.length - 1; l++)
+    for (let i = 0; i < layers[l]; i++) for (let o = 0; o < layers[l + 1]; o++) seg.push(pos[l][i], pos[l + 1][o]);
+  const lineGeo = new THREE.BufferGeometry().setFromPoints(seg);
+  lineGeo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(seg.length * 3), 3));
+  scene.add(new THREE.LineSegments(lineGeo, new THREE.LineBasicMaterial({ vertexColors: true })));
+
+  const label = (text, x, y, z, align, h = 0.38) => {
+    const c = document.createElement('canvas'), ctx = c.getContext('2d'), font = '500 40px Inter, system-ui, sans-serif';
+    ctx.font = font; c.width = Math.ceil(ctx.measureText(text).width) + 8; c.height = 56;
+    ctx.font = font; ctx.fillStyle = C.muted; ctx.textBaseline = 'middle'; ctx.fillText(text, 4, 30);
+    const tex = new THREE.CanvasTexture(c); tex.minFilter = THREE.LinearFilter;
+    const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthWrite: false }));
+    s.scale.set(h * c.width / c.height, h, 1);
+    s.position.set(x + align * s.scale.x / 2, y, z); scene.add(s);
+  };
+  R.features.forEach((f, k) => label(f, pos[0][k].x - 0.45, pos[0][k].y, 0, -1));
+  label('prix', pos.at(-1)[0].x + 0.45, 0, 0, 1);
+  const top = Math.max(...all.map(p => p.y)) + 1.1;  // nom de chaque couche au-dessus d'elle
+  ['Entrée · ' + layers[0], ...layers.slice(1, -1).map((n, i) => `Cachée ${i + 1} · ${n}`), 'Sortie · 1'].forEach((t, l) =>
+    label(t, pos[l][0].x, top, 0, 0, 0.5));
+
+  const bg = new THREE.Color(css('--surface')), pos3 = new THREE.Color(C.py), neg3 = new THREE.Color(C.rs), tmp = new THREE.Color();
+  const tint = (v, max) => tmp.copy(bg).lerp(v >= 0 ? pos3 : neg3, Math.min(1, Math.abs(v) / (max || 1)) ** 0.7);
+  const maxAbs = a => a.reduce((m, v) => Math.max(m, Math.abs(v)), 0);
+
+  let frame = 0, car = 0, playing = true, acc = 0, last = 0;
+  const scrub = $id('n-scrub'), play = $id('n-play'), carSel = $id('n-car');
+  scrub.max = frames.length - 1;
+  carSel.innerHTML = R.test.actual.map((a, i) => `<option value="${i}">Voiture ${i + 1} · ${usd(a)}</option>`).join('');
+
+  function draw() {
+    const f = frames[frame];
+    // Propagation avant de la voiture choisie avec les poids de cette epoch
+    const acts = [X[car]];
+    f.w.forEach((w, l) => {
+      const out = layers[l + 1], prev = acts[l];
+      const z = f.b[l].map((b, o) => prev.reduce((s, a, i) => s + a * w[i * out + o], b));
+      acts.push(l < f.w.length - 1 ? z.map(v => Math.max(0, v)) : z);
+    });
+    let k = 0;
+    acts.forEach(a => { const m = maxAbs(a); a.forEach(v => nodes.setColorAt(k++, tint(v, m))); });
+    nodes.instanceColor.needsUpdate = true;
+    const col = lineGeo.attributes.color; let s = 0;
+    f.w.forEach(w => { const m = maxAbs(w); w.forEach(v => { tint(v, m); col.setXYZ(s++, tmp.r, tmp.g, tmp.b); col.setXYZ(s++, tmp.r, tmp.g, tmp.b); }); });
+    col.needsUpdate = true;
+    const pred = acts.at(-1)[0] * net.y_std + net.y_mean, real = R.test.actual[car];
+    $id('n-epoch').textContent = `${fr(f.epoch)} / ${fr(frames.at(-1).epoch)}`;
+    $id('n-real').textContent = usd(real); $id('n-pred').textContent = usd(pred);
+    $id('n-err').textContent = `${pred > real ? '+' : ''}${fr((pred - real) / real * 100, 1)} %`;
+    scrub.value = frame;
+  }
+  const setPlay = p => { playing = p; play.textContent = p ? 'Pause' : 'Lecture'; };
+  play.onclick = () => { if (frame >= frames.length - 1) frame = 0; setPlay(!playing); };
+  scrub.oninput = () => { setPlay(false); frame = +scrub.value; draw(); };
+  carSel.onchange = () => { car = +carSel.value; draw(); };
+  controls.addEventListener('start', () => (controls.autoRotate = false));
+
+  function resize() {
+    const w = el.clientWidth, h = el.clientHeight;
+    renderer.setSize(w, h); camera.aspect = w / h;
+    camera.position.setLength(Math.max(24, 15 / Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) / camera.aspect));
+    camera.updateProjectionMatrix();
+  }
+  new ResizeObserver(resize).observe(el);
+  draw();
+  renderer.setAnimationLoop(t => {
+    if (playing) {
+      acc += t - (last || t);
+      if (acc > 140 && frame < frames.length - 1) { frame++; acc = 0; draw(); }
+      if (frame >= frames.length - 1) setPlay(false);
+    }
+    last = t;
+    controls.update();
+    renderer.render(scene, camera);
+  });
+})();
 </script>
 </body>
 </html>

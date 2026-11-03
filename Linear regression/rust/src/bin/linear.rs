@@ -1,5 +1,7 @@
 //! Regression lineaire multiple, descente de gradient batch, codee from scratch en Rust.
+//! Le lot est stocke par variable : erreurs et gradients sont calcules par les noyaux SIMD.
 
+use ml_models::simd::{dot, matmul, sum, to_columns};
 use ml_models::{record, run, weights_json, Model, Snap};
 
 const LEARNING_RATE: f64 = 0.01;
@@ -21,24 +23,21 @@ impl Model for LinearRegression {
 }
 
 fn fit(x: &[Vec<f64>], y: &[f64], mut snap: Snap) -> LinearRegression {
-    let (n, d) = (x.len() as f64, x[0].len());
-    let mut model = LinearRegression { w: vec![0.0; d], b: 0.0, history: Vec::with_capacity(EPOCHS) };
+    let (cols, np) = to_columns(x); // np = n arrondi pour le SIMD, remplissage a 0
+    let (n, scale) = (x.len(), LEARNING_RATE * 2.0 / x.len() as f64);
+    let mut model = LinearRegression { w: vec![0.0; x[0].len()], b: 0.0, history: Vec::with_capacity(EPOCHS) };
+    let mut error = vec![0.0; np];
     for epoch in 0..EPOCHS {
         record(&mut snap, epoch, EPOCHS, &model);
-        let (mut grad_w, mut grad_b, mut mse) = (vec![0.0; d], 0.0, 0.0);
-        for (xi, yi) in x.iter().zip(y) {
-            let error = model.predict(xi) - yi;
-            for (g, v) in grad_w.iter_mut().zip(xi) {
-                *g += error * v;
-            }
-            grad_b += error;
-            mse += error * error;
+        let (w, b) = (&model.w, model.b);
+        matmul(&mut error, &cols, np, |_| b, |_, j| w[j]); // error = X w + b
+        error.iter_mut().zip(y).for_each(|(e, y)| *e -= y);
+        error[n..].fill(0.0); // exemples de remplissage : sans effet sur les gradients
+        for (w, col) in model.w.iter_mut().zip(cols.chunks_exact(np)) {
+            *w -= scale * dot(col, &error);
         }
-        for (w, g) in model.w.iter_mut().zip(&grad_w) {
-            *w -= LEARNING_RATE * 2.0 / n * g;
-        }
-        model.b -= LEARNING_RATE * 2.0 / n * grad_b;
-        model.history.push(mse / n);
+        model.b -= scale * sum(&error);
+        model.history.push(dot(&error, &error) / n as f64);
     }
     record(&mut snap, EPOCHS, EPOCHS, &model);
     model

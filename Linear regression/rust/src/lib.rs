@@ -1,6 +1,8 @@
 //! Briques partagees par les modeles Rust : donnees, split, metriques, benchmark, export JSON.
 //! Aucune dependance externe : uniquement la bibliotheque standard.
 
+pub mod simd;
+
 use std::error::Error;
 use std::fs;
 use std::time::Instant;
@@ -86,7 +88,7 @@ fn metrics(y: &[f64], pred: &[f64]) -> (f64, f64) {
     ((ss_res / n).sqrt(), 1.0 - ss_res / ss_tot)
 }
 
-fn json_array(values: &[f64]) -> String {
+pub fn json_array(values: &[f64]) -> String {
     format!("[{}]", values.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","))
 }
 
@@ -179,7 +181,7 @@ pub fn run<M: Model>(
     let train_ms = times[RUNS / 2];
 
     let mut fields = vec![
-        format!(r#""model":"{name}","language":"Rust","train_ms":{train_ms},"runs_ms":{runs_ms}"#),
+        format!(r#""model":"{name}","language":"Rust","train_ms":{train_ms},"runs_ms":{runs_ms},"features":{FEATURES:?}"#),
         format!(r#""loss":{},"snapshots":[{}]"#, json_array(model.history()), snapshots.join(",")),
     ];
     println!("[{name}] Rust");
@@ -188,9 +190,10 @@ pub fn run<M: Model>(
         let (rmse, r2) = metrics(yp, &pred);
         println!("  {part:5} RMSE = {rmse:>8.0} $ | R2 = {r2:.4}");
         fields.push(format!(
-            r#""{part}":{{"rmse":{rmse},"r2":{r2},"actual":{},"predicted":{}}}"#,
+            r#""{part}":{{"rmse":{rmse},"r2":{r2},"actual":{},"predicted":{},"x":[{}]}}"#,
             json_array(yp),
-            json_array(&pred)
+            json_array(&pred),
+            xp.iter().map(|r| json_array(r)).collect::<Vec<_>>().join(",")
         ));
     }
     println!("  temps median ({RUNS} runs) = {train_ms:.2} ms\n");
