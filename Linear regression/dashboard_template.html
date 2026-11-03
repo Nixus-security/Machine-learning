@@ -139,7 +139,8 @@
     <strong>Méthodologie</strong>
     <ul>
       <li>Données : 159 voitures complètes, 13 variables numériques standardisées, split 80 / 20 identique (générateur LCG commun).</li>
-      <li>Python : NumPy vectorisé (OpenBLAS). Rust : bibliothèque standard uniquement, compilé en <code>--release</code>.</li>
+      <li>Python : NumPy vectorisé (OpenBLAS). Rust : bibliothèque standard uniquement, compilé en <code>--release</code> ; le réseau de neurones exploite le SIMD et tous les cœurs (threads).</li>
+      <li>Test en direct (3D) : <code>python live.py</code>, les deux langages s'entraînent en parallèle sur 1 cœur chacun.</li>
       <li>Le temps mesuré exclut l'enregistrement des états utilisés pour l'animation.</li>
     </ul>
   </div>

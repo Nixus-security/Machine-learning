@@ -96,6 +96,36 @@ pub fn weights_json(w: &[f64], b: f64) -> Vec<String> {
     vec![format!(r#""weights":{{{weights}}},"bias":{b}"#)]
 }
 
+/// Test de charge : entraine en boucle pendant `secs` secondes et ecrit sur stdout une ligne JSON
+/// toutes les ~50 ms (epochs cumulees, entrainements termines, MSE courante) pour l'interface en direct.
+fn bench<M: Model>(secs: f64, fit: impl Fn(Snap) -> M) -> Result<(), Box<dyn Error>> {
+    let start = Instant::now();
+    let ms = || start.elapsed().as_secs_f64() * 1000.0;
+    let emit = |t: f64, epochs: usize, runs: usize, loss: f64| {
+        println!(r#"{{"t":{t},"epochs":{epochs},"runs":{runs},"loss":{loss}}}"#);
+    };
+    let (mut done, mut prev, mut runs, mut loss, mut last_emit) = (0, 0, 0, 0.0, f64::MIN);
+    let mut progress = |epoch: usize, m: &dyn Model| {
+        if epoch < prev {
+            // nouvel entrainement : le precedent est termine
+            done += prev;
+            runs += 1;
+        }
+        prev = epoch;
+        loss = m.history().last().copied().unwrap_or(loss);
+        let t = ms();
+        if t - last_emit >= 50.0 {
+            last_emit = t;
+            emit(t, done + epoch, runs, loss);
+        }
+    };
+    while ms() < secs * 1000.0 {
+        fit(Some(&mut progress));
+    }
+    emit(ms(), done + prev, runs + 1, loss);
+    Ok(())
+}
+
 /// Entraine, chronometre (mediane de RUNS) et exporte `results/<name>_rust.json`.
 /// `extra` ajoute des champs JSON propres au modele (ex. `"bias":1.0`).
 pub fn run<M: Model>(
@@ -121,6 +151,11 @@ pub fn run<M: Model>(
     let (x_train, y_train) = pick(train);
     let (x_test, y_test) = pick(test);
     let predict = |m: &dyn Model, xp: &[Vec<f64>]| -> Vec<f64> { xp.iter().map(|r| m.predict(r)).collect() };
+
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(secs) = args.iter().position(|a| a == "--bench").and_then(|i| args.get(i + 1)) {
+        return bench(secs.parse()?, |snap| fit(&x_train, &y_train, snap));
+    }
 
     let mut snapshots = Vec::new();
     let mut snap = |epoch: usize, m: &dyn Model| {
