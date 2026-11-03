@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Test en direct</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<style>
+  :root {
+    --bg: #f7f7f5; --surface: rgba(255,255,255,.86); --line: #e6e6e2; --text: #1c1c1a; --muted: #6b6b66; --faint: #a3a39e;
+    --py: #3565c4; --rs: #b4531f;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #121212; --surface: rgba(26,26,26,.86); --line: #2b2b2b; --text: #ececea; --muted: #9b9b96; --faint: #5e5e5a;
+      --py: #7398e6; --rs: #e0814f; }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; }
+  body { background: var(--bg); color: var(--text); font: 14px/1.5 Inter, system-ui, -apple-system, "Segoe UI", sans-serif; -webkit-font-smoothing: antialiased; }
+  canvas { position: fixed; inset: 0; display: block; }
+  .panel { position: fixed; background: var(--surface); border: 1px solid var(--line); border-radius: 10px;
+    backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); }
+  .num { font-variant-numeric: tabular-nums; }
+
+  .top { top: 16px; left: 16px; right: 16px; padding: 14px 18px; display: flex; flex-wrap: wrap; gap: 12px 24px; align-items: center; justify-content: space-between; }
+  .top h1 { margin: 0; font-size: 16px; font-weight: 600; letter-spacing: -.01em; }
+  .top p { margin: 0; color: var(--muted); font-size: 13px; }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  select, button { border: 1px solid var(--line); background: var(--bg); color: var(--text); font: inherit; font-size: 13px; border-radius: 8px; padding: 7px 10px; }
+  button { cursor: pointer; background: var(--text); color: var(--bg); border-color: var(--text); font-weight: 500; padding: 7px 16px; }
+  button:disabled { opacity: .5; cursor: default; }
+
+  .ratio { margin-left: auto; text-align: right; }
+  .ratio .label { color: var(--muted); font-size: 12px; }
+  .ratio .val { font-size: 22px; font-weight: 600; letter-spacing: -.02em; line-height: 1.2; }
+
+  .lang { bottom: 16px; width: min(320px, calc(50% - 24px)); padding: 16px 18px; }
+  .lang.py { left: 16px; } .lang.rs { right: 16px; }
+  .lang h2 { margin: 0 0 10px; font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+  .lang h2 i { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+  .lang dl { margin: 0; display: grid; grid-template-columns: 1fr 1fr; gap: 10px 16px; }
+  .lang dt { color: var(--muted); font-size: 12px; }
+  .lang dd { margin: 0; font-size: 18px; font-weight: 600; }
+  .legend { bottom: 16px; left: 50%; transform: translateX(-50%); padding: 10px 14px; color: var(--muted); font-size: 12px; max-width: 300px; text-align: center; }
+  @media (max-width: 860px) { .legend { display: none; } .ratio { margin-left: 0; text-align: left; } }
+  @media (max-width: 560px) {
+    .lang { width: calc(50% - 20px); padding: 12px; } .lang.py { left: 12px; } .lang.rs { right: 12px; }
+    .lang dl { grid-template-columns: 1fr; gap: 6px; } .lang dd { font-size: 15px; }
+    .top { left: 12px; right: 12px; top: 12px; }
+  }
+</style>
+</head>
+<body>
+<div class="panel top">
+  <div>
+    <h1>Test de charge en direct · Python vs Rust</h1>
+    <p id="status">Choisissez un modèle puis lancez le test : les deux langages entraînent en boucle, en parallèle.</p>
+  </div>
+  <div class="ratio"><div class="label">Rust / Python</div><div class="val num" id="ratio">–</div></div>
+  <div class="controls">
+    <select id="model" aria-label="Modèle">
+      <option value="mlp">Réseau de neurones</option>
+      <option value="sgd">Gradient stochastique</option>
+      <option value="linear">Régression linéaire</option>
+    </select>
+    <select id="seconds" aria-label="Durée">
+      <option value="5">5 s</option><option value="10" selected>10 s</option><option value="20">20 s</option><option value="30">30 s</option>
+    </select>
+    <button id="go">Lancer le test</button>
+  </div>
+</div>
+
+
+<div class="panel legend">Rubans : débit instantané en epochs/s (échelle log) au fil du temps. Colonnes : epochs cumulées (échelle linéaire). Glisser pour tourner, molette pour zoomer.</div>
+
+<div class="panel lang py" id="card-python">
+  <h2><i style="background:var(--py)"></i>Python · NumPy</h2>
+  <dl class="num">
+    <div><dt>Débit</dt><dd data-k="eps">–</dd></div>
+    <div><dt>Epochs cumulées</dt><dd data-k="epochs">–</dd></div>
+    <div><dt>Entraînements</dt><dd data-k="runs">–</dd></div>
+    <div><dt>MSE courante</dt><dd data-k="loss">–</dd></div>
+  </dl>
+</div>
+<div class="panel lang rs" id="card-rust">
+  <h2><i style="background:var(--rs)"></i>Rust · std</h2>
+  <dl class="num">
+    <div><dt>Débit</dt><dd data-k="eps">–</dd></div>
+    <div><dt>Epochs cumulées</dt><dd data-k="epochs">–</dd></div>
+    <div><dt>Entraînements</dt><dd data-k="runs">–</dd></div>
+    <div><dt>MSE courante</dt><dd data-k="loss">–</dd></div>
+  </dl>
+</div>
+
+<script>
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const fr = (v, d = 0) => v.toLocaleString('fr-FR', { minimumFractionDigits: d, maximumFractionDigits: d });
+const short = v => v >= 1e6 ? fr(v / 1e6, 1) + ' M' : v >= 1e4 ? fr(v / 1e3, 0) + ' k' : fr(v);
+
+// ---------- Scène ----------
+const TW = 20, YS = 1.4, DECADES = 7, MAX = 4000;  // largeur de l'axe du temps, hauteur par décade, points max
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setClearColor(css('--bg'));
+document.body.prepend(renderer.domElement);
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(40, 1, 0.1, 200);
+const controls = new THREE.OrbitControls(camera, renderer.domElement);
+controls.target.set(TW / 2 + 2, 3.2, 0);
+controls.enableDamping = true;
+controls.maxPolarAngle = Math.PI / 2 - 0.05;
+scene.add(new THREE.AmbientLight(0xffffff, 0.75));
+const sun = new THREE.DirectionalLight(0xffffff, 0.6);
+sun.position.set(-6, 14, 10);
+scene.add(sun);
+
+const lineColor = new THREE.Color(css('--line')), muted = css('--muted');
+const grid = new THREE.GridHelper(TW + 8, TW + 8, lineColor, lineColor);
+grid.position.set(TW / 2 + 2, 0, 0);
+scene.add(grid);
+
+function label(text, color, size = 0.5) {
+  const c = document.createElement('canvas'), ctx = c.getContext('2d');
+  ctx.font = '500 48px Inter, system-ui, sans-serif';
+  c.width = Math.ceil(ctx.measureText(text).width) + 8; c.height = 64;
+  ctx.font = '500 48px Inter, system-ui, sans-serif';
+  ctx.fillStyle = color; ctx.textBaseline = 'middle'; ctx.fillText(text, 4, 34);
+  const tex = new THREE.CanvasTexture(c);
+  tex.minFilter = THREE.LinearFilter;
+  const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthWrite: false }));
+  s.scale.set(size * c.width / c.height, size, 1);
+  return s;
+}
+const segment = (a, b, color) => new THREE.Line(new THREE.BufferGeometry().setFromPoints([a, b]), new THREE.LineBasicMaterial({ color }));
+
+// Graduations : décades sur le mur du fond, secondes au sol
+const V = THREE.Vector3;
+for (let k = 0; k <= DECADES; k++) {
+  const y = k * YS;
+  scene.add(segment(new V(0, y, -4), new V(TW, y, -4), lineColor));
+  const t = label(['1', '10', '100', '1 k', '10 k', '100 k', '1 M', '10 M'][k] + ' ep/s', muted, 0.42);
+  t.position.set(-1.4, y, -4);
+  scene.add(t);
+}
+const timeLabels = [];
+function setTimeAxis(seconds) {
+  timeLabels.forEach(l => scene.remove(l));
+  timeLabels.length = 0;
+  for (let i = 0; i <= 4; i++) {
+    const l = label(`${fr(seconds * i / 4, seconds % 4 ? 1 : 0)} s`, muted, 0.42);
+    l.position.set(TW * i / 4, 0.01, 4.6);
+    scene.add(l); timeLabels.push(l);
+  }
+}
+
+const lanes = {};
+for (const [lang, z, name] of [['python', 2.2, 'Python'], ['rust', -2.2, 'Rust']]) {
+  const color = new THREE.Color(css(lang === 'python' ? '--py' : '--rs'));
+  const area = new THREE.Mesh(new THREE.BufferGeometry(),
+    new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.22, side: THREE.DoubleSide, depthWrite: false }));
+  area.geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(MAX * 18), 3));
+  const line = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color }));
+  line.geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(MAX * 3), 3));
+  const head = new THREE.Mesh(new THREE.SphereGeometry(0.16, 20, 12), new THREE.MeshBasicMaterial({ color }));
+  const tower = new THREE.Mesh(new THREE.BoxGeometry(1.4, 1, 1.4).translate(0, 0.5, 0), new THREE.MeshLambertMaterial({ color }));
+  tower.position.set(TW + 3, 0, z);
+  const name3d = label(name, css('--text'), 0.55);
+  name3d.position.set(TW + 3, 0.6, z);
+  scene.add(area, line, head, tower, name3d);
+  lanes[lang] = { z, area, line, head, tower, name3d, pts: [], last: null, eps: 0, epochs: 0, card: document.getElementById('card-' + lang) };
+}
+
+function reset(seconds) {
+  setTimeAxis(seconds);
+  for (const L of Object.values(lanes)) {
+    Object.assign(L, { pts: [], last: null, eps: 0, epochs: 0 });
+    L.area.geometry.setDrawRange(0, 0); L.line.geometry.setDrawRange(0, 0);
+    L.head.visible = false; setTower(L, 0);
+    L.card.querySelectorAll('dd').forEach(d => (d.textContent = '–'));
+  }
+  document.getElementById('ratio').textContent = '–';
+}
+
+function setTower(L, frac) {  // hauteur max 6, nom du langage au sommet
+  L.tower.scale.y = Math.max(0.001, 6 * frac);
+  L.name3d.position.y = 6 * frac + 0.6;
+}
+
+function addPoint(L, x, y) {
+  const p = L.pts, k = p.length;
+  if (k >= MAX) return;
+  p.push([x, y]);
+  L.line.geometry.attributes.position.setXYZ(k, x, y, L.z);
+  L.line.geometry.attributes.position.needsUpdate = true;
+  L.line.geometry.setDrawRange(0, k + 1);
+  if (k > 0) {
+    const [x0, y0] = p[k - 1], a = L.area.geometry.attributes.position, z = L.z, i = (k - 1) * 6;
+    [[x0, 0], [x0, y0], [x, y], [x0, 0], [x, y], [x, 0]].forEach(([vx, vy], j) => a.setXYZ(i + j, vx, vy, z));
+    a.needsUpdate = true;
+    L.area.geometry.setDrawRange(0, k * 6);
+  }
+  L.head.visible = true;
+  L.head.position.set(x, y, L.z);
+}
+
+// ---------- Flux en direct ----------
+let source = null, seconds = 10;
+const status = document.getElementById('status'), go = document.getElementById('go');
+
+function onSample(d) {
+  const L = lanes[d.lang];
+  if (L.last && d.t > L.last.t) {
+    const inst = (d.epochs - L.last.epochs) / (d.t - L.last.t) * 1000;
+    L.eps = L.eps ? 0.65 * L.eps + 0.35 * inst : inst;  // lissage exponentiel
+    addPoint(L, Math.min(d.t / 1000 / seconds, 1) * TW, Math.max(0, Math.log10(Math.max(L.eps, 1))) * YS);
+  }
+  L.last = d; L.epochs = d.epochs;
+  const set = (k, v) => (L.card.querySelector(`[data-k="${k}"]`).textContent = v);
+  set('eps', short(L.eps) + '/s'); set('epochs', short(d.epochs)); set('runs', fr(d.runs)); set('loss', fr(d.loss / 1e6, 2) + ' M');
+  const { python: p, rust: r } = lanes, top = Math.max(p.epochs, r.epochs, 1);
+  setTower(p, p.epochs / top);
+  setTower(r, r.epochs / top);
+  if (p.epochs && r.epochs) document.getElementById('ratio').textContent = `×${fr(r.epochs / p.epochs, 1)}`;
+}
+
+go.onclick = () => {
+  seconds = +document.getElementById('seconds').value;
+  const model = document.getElementById('model').value;
+  reset(seconds);
+  go.disabled = true;
+  status.textContent = 'Démarrage…';
+  source = new EventSource(`/stream?model=${model}&seconds=${seconds}`);
+  source.addEventListener('start', e => {
+    const m = JSON.parse(e.data);
+    status.textContent = `En cours · ${m.seconds} s · 1 cœur CPU par langage`;
+  });
+  source.onmessage = e => onSample(JSON.parse(e.data));
+  source.addEventListener('end', () => {
+    source.close(); go.disabled = false;
+    const { python: p, rust: r } = lanes;
+    status.textContent = `Terminé · Rust a traité ${fr(r.epochs / Math.max(p.epochs, 1), 1)}× plus d'epochs que Python dans le même temps.`;
+  });
+  source.onerror = () => {
+    source.close(); go.disabled = false;
+    status.textContent = 'Connexion impossible : lancez « python live.py » puis ouvrez http://127.0.0.1:8765';
+  };
+};
+
+function resize() {
+  renderer.setSize(innerWidth, innerHeight);
+  camera.aspect = innerWidth / innerHeight;
+  // Recule la camera jusqu'a ce que toute la scene (~34 unites de large) tienne dans l'ecran
+  const halfH = Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)), halfW = halfH * camera.aspect;
+  const dist = Math.max(26, 17 / halfW, 9 / halfH);
+  camera.position.copy(controls.target).addScaledVector(new V(-0.3, 0.16, 1).normalize(), dist);
+  camera.updateProjectionMatrix();
+}
+addEventListener('resize', resize);
+resize();
+setTimeAxis(seconds);
+renderer.setAnimationLoop(() => { controls.update(); renderer.render(scene, camera); });
+</script>
+</body>
+</html>
