@@ -65,7 +65,11 @@ cd rust && cargo run --release --bin mlp
 - une synthèse des accélérations et un tableau comparatif ;
 - la relecture de l'entraînement epoch par epoch (prix réel vs prédit, courbe d'erreur) ;
 - les temps de chaque exécution, et les poids appris ou l'architecture du réseau ;
-- le **réseau de neurones en 3D** : ses 62 neurones et 944 connexions, colorés par signe et amplitude des poids, rejoués au fil de l'entraînement ; on choisit une voiture du jeu de test pour voir les neurones s'activer et la prédiction converger.
+- le **réseau de neurones en 3D** : ses 62 neurones et 944 connexions, rejoués au fil de l'entraînement. On choisit une voiture du jeu de test et on suit son passage dans le réseau :
+  - une onde de propagation fait pulser les couches une à une, et des particules parcourent les connexions qui transmettent le plus de signal ;
+  - la taille et le halo d'un neurone montrent la force de son activation ; les neurones éteints (ReLU = 0) sont en gris ;
+  - la couleur des liens montre le signal transmis (activation × poids) ;
+  - le survol d'un neurone affiche le détail, et le nombre de neurones actifs par couche est indiqué.
 
 Le thème clair ou sombre suit celui du système.
 

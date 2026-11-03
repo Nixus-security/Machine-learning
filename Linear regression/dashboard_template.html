@@ -76,6 +76,9 @@
   .net-wrap { position: relative; height: clamp(300px, 60vw, 520px); margin: 0 -24px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
   .net-wrap canvas { display: block; width: 100%; height: 100%; cursor: grab; }
   #n-car { min-width: 0; max-width: 45%; }
+  .net-tip { position: absolute; pointer-events: none; background: var(--surface); border: 1px solid var(--line); border-radius: 8px;
+    padding: 6px 10px; font-size: 12px; line-height: 1.45; color: var(--muted); box-shadow: 0 4px 16px rgba(0,0,0,.08); white-space: nowrap; }
+  .net-tip b { color: var(--text); font-weight: 600; }
   .net-legend { display: flex; flex-wrap: wrap; gap: 8px 20px; color: var(--muted); font-size: 12px; margin-top: 16px; }
   .net-legend i { display: inline-block; width: 18px; height: 3px; border-radius: 2px; vertical-align: middle; margin-right: 6px; }
   .method { margin-top: 48px; padding-top: 24px; border-top: 1px solid var(--line); color: var(--muted); font-size: 13px; }
@@ -159,10 +162,12 @@
       </div>
       <div class="net-wrap" id="net3d"></div>
       <div class="net-legend">
-        <span><i style="background:var(--py)"></i>Poids / activation positifs</span>
-        <span><i style="background:var(--rs)"></i>Poids / activation négatifs</span>
-        <span>Intensité = amplitude (normalisée par couche)</span>
-        <span>Glisser pour tourner, molette pour zoomer</span>
+        <span><i style="background:var(--py)"></i>Signal / activation positifs</span>
+        <span><i style="background:var(--rs)"></i>Signal / activation négatifs</span>
+        <span><i style="background:var(--faint)"></i>Neurone éteint (ReLU = 0)</span>
+        <span>Halo et taille = force d'activation · liens = activation × poids</span>
+        <span>Survoler un neurone pour le détail · glisser pour tourner</span>
+        <span class="num" id="n-active" style="color:var(--text)"></span>
       </div>
     </div>
   </section>
@@ -357,11 +362,23 @@ requestAnimationFrame(t => { last = t; requestAnimationFrame(tick); });
     const rows = Math.ceil(count / cols);
     return Array.from({ length: count }, (_, k) => new THREE.Vector3(x, ((rows - 1) / 2 - k % rows) * 0.85, (Math.floor(k / rows) - (cols - 1) / 2) * 1.1));
   });
-  const all = pos.flat();
+  const all = pos.flat(), meta = layers.flatMap((n, l) => Array.from({ length: n }, (_, i) => ({ l, i })));
   const nodes = new THREE.InstancedMesh(new THREE.SphereGeometry(0.2, 18, 12), new THREE.MeshLambertMaterial(), all.length);
-  const m4 = new THREE.Matrix4();
-  all.forEach((p, i) => { nodes.setMatrixAt(i, m4.makeTranslation(p.x, p.y, p.z)); nodes.setColorAt(i, new THREE.Color()); });
+  all.forEach((_, i) => nodes.setColorAt(i, new THREE.Color()));
   scene.add(nodes);
+
+  // Texture de halo (dégradé radial) partagée par les halos des neurones et les particules de signal
+  const glowTex = (() => {
+    const c = document.createElement('canvas'); c.width = c.height = 64;
+    const ctx = c.getContext('2d'), g = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+    g.addColorStop(0, 'rgba(255,255,255,1)'); g.addColorStop(0.35, 'rgba(255,255,255,.45)'); g.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, 64, 64);
+    return new THREE.CanvasTexture(c);
+  })();
+  const halos = all.map(p => {
+    const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTex, transparent: true, depthWrite: false, opacity: 0 }));
+    s.position.copy(p); scene.add(s); return s;
+  });
 
   const seg = [];
   for (let l = 0; l < layers.length - 1; l++)
@@ -369,6 +386,13 @@ requestAnimationFrame(t => { last = t; requestAnimationFrame(tick); });
   const lineGeo = new THREE.BufferGeometry().setFromPoints(seg);
   lineGeo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(seg.length * 3), 3));
   scene.add(new THREE.LineSegments(lineGeo, new THREE.LineBasicMaterial({ vertexColors: true })));
+
+  // Particules : le signal (activation x poids) circule sur les connexions les plus fortes
+  const TOP = [28, 24, 10], MAXP = TOP.reduce((a, b) => a + b, 0);
+  const partGeo = new THREE.BufferGeometry();
+  partGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(MAXP * 3), 3));
+  partGeo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(MAXP * 3), 3));
+  scene.add(new THREE.Points(partGeo, new THREE.PointsMaterial({ size: 0.42, map: glowTex, vertexColors: true, transparent: true, depthWrite: false })));
 
   const label = (text, x, y, z, align, h = 0.38) => {
     const c = document.createElement('canvas'), ctx = c.getContext('2d'), font = '500 40px Inter, system-ui, sans-serif';
@@ -382,14 +406,18 @@ requestAnimationFrame(t => { last = t; requestAnimationFrame(tick); });
   R.features.forEach((f, k) => label(f, pos[0][k].x - 0.45, pos[0][k].y, 0, -1));
   label('prix', pos.at(-1)[0].x + 0.45, 0, 0, 1);
   const top = Math.max(...all.map(p => p.y)) + 1.1;  // nom de chaque couche au-dessus d'elle
-  ['Entrée · ' + layers[0], ...layers.slice(1, -1).map((n, i) => `Cachée ${i + 1} · ${n}`), 'Sortie · 1'].forEach((t, l) =>
-    label(t, pos[l][0].x, top, 0, 0, 0.5));
+  const layerNames = ['Entrée', ...layers.slice(1, -1).map((_, i) => `Cachée ${i + 1}`), 'Sortie'];
+  layerNames.forEach((t, l) => label(`${t} · ${layers[l]}`, pos[l][0].x, top, 0, 0, 0.5));
 
-  const bg = new THREE.Color(css('--surface')), pos3 = new THREE.Color(C.py), neg3 = new THREE.Color(C.rs), tmp = new THREE.Color();
-  const tint = (v, max) => tmp.copy(bg).lerp(v >= 0 ? pos3 : neg3, Math.min(1, Math.abs(v) / (max || 1)) ** 0.7);
+  const bg = new THREE.Color(css('--surface')), pos3 = new THREE.Color(C.py), neg3 = new THREE.Color(C.rs);
+  const off = new THREE.Color(C.faint), tmp = new THREE.Color();
+  const tint = (v, max, k = 0.7) => tmp.copy(bg).lerp(v >= 0 ? pos3 : neg3, Math.min(1, Math.abs(v) / (max || 1)) ** k);
   const maxAbs = a => a.reduce((m, v) => Math.max(m, Math.abs(v)), 0);
+  const calm = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (calm) controls.autoRotate = false;
 
   let frame = 0, car = 0, playing = true, acc = 0, last = 0;
+  let acts = [], norm = [], flows = [];  // activations, intensité 0..1 par neurone, signaux les plus forts
   const scrub = $id('n-scrub'), play = $id('n-play'), carSel = $id('n-car');
   scrub.max = frames.length - 1;
   carSel.innerHTML = R.test.actual.map((a, i) => `<option value="${i}">Voiture ${i + 1} · ${usd(a)}</option>`).join('');
@@ -397,24 +425,84 @@ requestAnimationFrame(t => { last = t; requestAnimationFrame(tick); });
   function draw() {
     const f = frames[frame];
     // Propagation avant de la voiture choisie avec les poids de cette epoch
-    const acts = [X[car]];
+    acts = [X[car]];
     f.w.forEach((w, l) => {
       const out = layers[l + 1], prev = acts[l];
       const z = f.b[l].map((b, o) => prev.reduce((s, a, i) => s + a * w[i * out + o], b));
       acts.push(l < f.w.length - 1 ? z.map(v => Math.max(0, v)) : z);
     });
-    let k = 0;
-    acts.forEach(a => { const m = maxAbs(a); a.forEach(v => nodes.setColorAt(k++, tint(v, m))); });
-    nodes.instanceColor.needsUpdate = true;
+    norm = acts.flatMap(a => { const m = maxAbs(a) || 1; return a.map(v => Math.abs(v) / m); });
+    // Liens colorés par le signal transmis (activation x poids) : un neurone éteint n'envoie rien
     const col = lineGeo.attributes.color; let s = 0;
-    f.w.forEach(w => { const m = maxAbs(w); w.forEach(v => { tint(v, m); col.setXYZ(s++, tmp.r, tmp.g, tmp.b); col.setXYZ(s++, tmp.r, tmp.g, tmp.b); }); });
+    flows = [];
+    f.w.forEach((w, l) => {
+      const out = layers[l + 1], sig = w.map((v, k) => acts[l][Math.floor(k / out)] * v), m = maxAbs(sig);
+      sig.forEach(v => { tint(v, m, 1.4); col.setXYZ(s++, tmp.r, tmp.g, tmp.b); col.setXYZ(s++, tmp.r, tmp.g, tmp.b); });
+      sig.map((v, k) => ({ l, i: Math.floor(k / out), o: k % out, v, n: Math.abs(v) / (m || 1) }))
+        .sort((a, b) => b.n - a.n).slice(0, TOP[l]).forEach(x => flows.push(x));
+    });
     col.needsUpdate = true;
     const pred = acts.at(-1)[0] * net.y_std + net.y_mean, real = R.test.actual[car];
     $id('n-epoch').textContent = `${fr(f.epoch)} / ${fr(frames.at(-1).epoch)}`;
     $id('n-real').textContent = usd(real); $id('n-pred').textContent = usd(pred);
     $id('n-err').textContent = `${pred > real ? '+' : ''}${fr((pred - real) / real * 100, 1)} %`;
+    $id('n-active').textContent = acts.slice(1, -1).map((a, i) => `${layerNames[i + 1]} : ${a.filter(v => v > 0).length}/${a.length} actifs`).join(' · ');
     scrub.value = frame;
   }
+
+  // Effets à chaque image : onde de propagation couche par couche, pulsation, halos et particules
+  const m4 = new THREE.Matrix4(), sc = new THREE.Vector3(), q = new THREE.Quaternion();
+  function animate(t) {
+    const wave = calm ? -9 : (t / 650) % (layers.length + 0.8);  // position de l'onde (en couches)
+    let k = 0;
+    acts.forEach((a, l) => {
+      const pulse = Math.max(0, 1 - Math.abs(wave - l) * 1.6);
+      const m = maxAbs(a);
+      a.forEach(v => {
+        const n = norm[k], dead = l > 0 && l < layers.length - 1 && v <= 0;  // ReLU éteint
+        const size = (dead ? 0.55 : 0.75 + (l ? 0.9 : 0.5) * n) * (1 + 0.45 * pulse * n);
+        nodes.setMatrixAt(k, m4.compose(all[k], q, sc.set(size, size, size)));
+        nodes.setColorAt(k, dead ? off : tint(v, m));
+        const h = halos[k];
+        h.material.opacity = dead ? 0 : n * (0.25 + 0.75 * pulse);
+        h.material.color.copy(v >= 0 ? pos3 : neg3);
+        h.scale.setScalar((0.6 + 1.5 * n) * (1 + 0.6 * pulse));
+        k++;
+      });
+    });
+    nodes.instanceMatrix.needsUpdate = true; nodes.instanceColor.needsUpdate = true;
+    const pp = partGeo.attributes.position, pc = partGeo.attributes.color; let c = 0;
+    for (const f of flows) {
+      const u = wave - f.l;
+      if (u < 0 || u > 1) continue;
+      const a = pos[f.l][f.i], b = pos[f.l + 1][f.o];
+      pp.setXYZ(c, a.x + (b.x - a.x) * u, a.y + (b.y - a.y) * u, a.z + (b.z - a.z) * u);
+      tmp.copy(bg).lerp(f.v >= 0 ? pos3 : neg3, 0.35 + 0.65 * f.n);
+      pc.setXYZ(c++, tmp.r, tmp.g, tmp.b);
+    }
+    partGeo.setDrawRange(0, c);
+    pp.needsUpdate = true; pc.needsUpdate = true;
+  }
+
+  // Infobulle au survol d'un neurone
+  const tip = document.createElement('div');
+  tip.className = 'net-tip'; tip.hidden = true; el.appendChild(tip);
+  const ray = new THREE.Raycaster(), mouse = new THREE.Vector2();
+  renderer.domElement.addEventListener('pointermove', e => {
+    const r = renderer.domElement.getBoundingClientRect();
+    mouse.set((e.clientX - r.left) / r.width * 2 - 1, -(e.clientY - r.top) / r.height * 2 + 1);
+    ray.setFromCamera(mouse, camera);
+    const hit = ray.intersectObject(nodes)[0];
+    if (!hit) { tip.hidden = true; return; }
+    const { l, i } = meta[hit.instanceId], v = acts[l][i];
+    tip.innerHTML = l === 0 ? `<b>${R.features[i]}</b><br>valeur standardisée ${fr(v, 2)}`
+      : l === layers.length - 1 ? `<b>Sortie</b><br>prix prédit ${usd(v * net.y_std + net.y_mean)}`
+      : `<b>${layerNames[l]} · neurone ${i + 1}</b><br>${v > 0 ? `activation ${fr(v, 2)}` : 'éteint (ReLU = 0)'}`;
+    tip.style.left = `${e.clientX - r.left + 14}px`; tip.style.top = `${e.clientY - r.top + 14}px`;
+    tip.hidden = false;
+  });
+  renderer.domElement.addEventListener('pointerleave', () => (tip.hidden = true));
+
   const setPlay = p => { playing = p; play.textContent = p ? 'Pause' : 'Lecture'; };
   play.onclick = () => { if (frame >= frames.length - 1) frame = 0; setPlay(!playing); };
   scrub.oninput = () => { setPlay(false); frame = +scrub.value; draw(); };
@@ -424,7 +512,7 @@ requestAnimationFrame(t => { last = t; requestAnimationFrame(tick); });
   function resize() {
     const w = el.clientWidth, h = el.clientHeight;
     renderer.setSize(w, h); camera.aspect = w / h;
-    camera.position.setLength(Math.max(24, 15 / Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) / camera.aspect));
+    camera.position.setLength(Math.max(28, 17 / Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) / camera.aspect));
     camera.updateProjectionMatrix();
   }
   new ResizeObserver(resize).observe(el);
@@ -436,6 +524,7 @@ requestAnimationFrame(t => { last = t; requestAnimationFrame(tick); });
       if (frame >= frames.length - 1) setPlay(false);
     }
     last = t;
+    animate(t);
     controls.update();
     renderer.render(scene, camera);
   });
