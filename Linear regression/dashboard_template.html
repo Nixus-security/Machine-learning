@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Régression linéaire — Python vs Rust</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0f1115; --card: #171a21; --line: #262b36; --text: #e8eaf0; --muted: #8b93a7;
+    --py: #4f8df7; --rs: #f2803a; --ok: #3fb68b;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 1200px; margin: 0 auto; padding: 32px 16px 64px; }
+  header h1 { margin: 0 0 4px; font-size: 28px; letter-spacing: -0.02em; }
+  header p { margin: 0 0 28px; color: var(--muted); }
+  .tag { display: inline-block; padding: 2px 10px; border-radius: 99px; font-size: 13px; font-weight: 600; }
+  .tag.py { background: color-mix(in srgb, var(--py) 20%, transparent); color: var(--py); }
+  .tag.rs { background: color-mix(in srgb, var(--rs) 20%, transparent); color: var(--rs); }
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-bottom: 16px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 20px; }
+  .kpi .label { color: var(--muted); font-size: 13px; text-transform: uppercase; letter-spacing: .05em; }
+  .kpi .row { display: flex; justify-content: space-between; align-items: baseline; margin-top: 10px; }
+  .kpi .val { font-size: 24px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .kpi .hint { margin-top: 8px; color: var(--ok); font-size: 13px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 480px), 1fr)); gap: 16px; margin-bottom: 16px; }
+  h2 { margin: 0 0 4px; font-size: 17px; }
+  .sub { margin: 0 0 16px; color: var(--muted); font-size: 13px; }
+  .chart { position: relative; height: 320px; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { padding: 8px 10px; text-align: right; border-bottom: 1px solid var(--line); }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--muted); font-weight: 500; font-size: 13px; }
+  .table-wrap { overflow-x: auto; max-height: 420px; }
+  .err-good { color: var(--ok); } .err-bad { color: #e5534b; }
+  .live { margin-bottom: 32px; }
+  .live-head { display: flex; flex-wrap: wrap; gap: 16px; justify-content: space-between; align-items: flex-start; }
+  .live-head .sub { max-width: 520px; }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .btn { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 7px 14px; font: inherit; cursor: pointer; }
+  .btn:hover { border-color: var(--muted); }
+  .btn.primary { background: var(--py); border-color: var(--py); color: #fff; min-width: 104px; }
+  .seg { display: flex; }
+  .seg .btn { border-radius: 0; }
+  .seg .btn:first-child { border-radius: 8px 0 0 8px; }
+  .seg .btn:last-child { border-radius: 0 8px 8px 0; border-left: 0; }
+  .seg .btn.on[data-src="python"] { background: var(--py); border-color: var(--py); color: #fff; }
+  .seg .btn.on[data-src="rust"] { background: var(--rs); border-color: var(--rs); color: #fff; }
+  .speed { color: var(--muted); font-size: 13px; display: flex; gap: 6px; align-items: center; }
+  .speed select { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; font: inherit; }
+  .live-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin: 16px 0 8px; }
+  .live-stats > div { background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; }
+  .live-stats .label { display: block; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .05em; }
+  .live-stats .val { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  #scrub { width: 100%; margin: 8px 0 16px; accent-color: var(--py); }
+  .live-grid { grid-template-columns: repeat(auto-fit, minmax(min(100%, 330px), 1fr)); margin: 0; }
+  h3 { margin: 0 0 8px; font-size: 14px; color: var(--muted); font-weight: 500; }
+  .section-title { font-size: 20px; margin: 0 0 16px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Prédiction du prix d'une voiture</h1>
+    <p>Régression linéaire multiple codée from scratch — <span class="tag py">Python + NumPy</span> vs <span class="tag rs">Rust (sans dépendance)</span></p>
+  </header>
+
+  <section class="card live">
+    <div class="live-head">
+      <div>
+        <h2>Entraînement en direct</h2>
+        <p class="sub">Descente de gradient rejouée epoch par epoch : les poids s'ajustent, l'erreur chute, les prédictions rejoignent la diagonale.</p>
+      </div>
+      <div class="controls">
+        <button id="play" class="btn primary" aria-label="Lecture / pause">⏸ Pause</button>
+        <button id="restart" class="btn" aria-label="Recommencer">↺ Rejouer</button>
+        <div class="seg" role="group" aria-label="Modèle affiché">
+          <button class="btn on" data-src="python">Python</button>
+          <button class="btn" data-src="rust">Rust</button>
+        </div>
+        <label class="speed">Vitesse
+          <select id="speed"><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option></select>
+        </label>
+      </div>
+    </div>
+    <div class="live-stats">
+      <div><span class="label">Epoch</span><span class="val" id="s-epoch">0</span></div>
+      <div><span class="label">MSE train</span><span class="val" id="s-mse">–</span></div>
+      <div><span class="label">RMSE test</span><span class="val" id="s-rmse">–</span></div>
+      <div><span class="label">R² test</span><span class="val" id="s-r2">–</span></div>
+    </div>
+    <input type="range" id="scrub" min="0" value="0" aria-label="Position dans l'entraînement">
+    <div class="grid live-grid">
+      <div>
+        <h3>Prix réel vs prédit</h3>
+        <div class="chart"><canvas id="live-scatter"></canvas></div>
+      </div>
+      <div>
+        <h3>Erreur (MSE) au fil des epochs</h3>
+        <div class="chart"><canvas id="live-loss"></canvas></div>
+      </div>
+      <div>
+        <h3>Poids du modèle</h3>
+        <div class="chart"><canvas id="live-weights"></canvas></div>
+      </div>
+    </div>
+  </section>
+
+  <h2 class="section-title">Résultats finaux</h2>
+  <section class="kpis" id="kpis"></section>
+
+  <section class="grid">
+    <div class="card">
+      <h2>Courbe d'apprentissage</h2>
+      <p class="sub">MSE sur le jeu d'entraînement à chaque epoch (échelle log)</p>
+      <div class="chart"><canvas id="loss"></canvas></div>
+    </div>
+    <div class="card">
+      <h2>Prix réel vs prédit</h2>
+      <p class="sub">Jeu de test — plus les points sont proches de la diagonale, meilleur est le modèle</p>
+      <div class="chart"><canvas id="scatter"></canvas></div>
+    </div>
+  </section>
+
+  <section class="grid">
+    <div class="card">
+      <h2>Importance des variables</h2>
+      <p class="sub">Poids appris sur les variables standardisées ($ par écart-type)</p>
+      <div class="chart" style="height:420px"><canvas id="weights"></canvas></div>
+    </div>
+    <div class="card">
+      <h2>Prédictions sur le jeu de test</h2>
+      <p class="sub">Comparaison voiture par voiture</p>
+      <div class="table-wrap"><table id="preds"></table></div>
+    </div>
+  </section>
+</main>
+
+<script>
+const DATA = __DATA__;
+const py = DATA.python, rs = DATA.rust;
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const PY = css('--py'), RS = css('--rs'), MUTED = css('--muted'), LINE = css('--line');
+const $ = v => Math.round(v).toLocaleString('fr-FR') + ' $';
+
+Chart.defaults.color = MUTED;
+Chart.defaults.borderColor = LINE;
+Chart.defaults.font.family = 'system-ui, -apple-system, "Segoe UI", sans-serif';
+
+// KPIs
+const speedup = py.train_ms / rs.train_ms;
+const kpis = [
+  ['RMSE test', $(py.test.rmse), $(rs.test.rmse), 'Erreur moyenne sur des voitures jamais vues'],
+  ['R² test', py.test.r2.toFixed(4), rs.test.r2.toFixed(4), `${(py.test.r2 * 100).toFixed(1)} % de la variance expliquée`],
+  ['R² train', py.train.r2.toFixed(4), rs.train.r2.toFixed(4), `${py.train.actual.length} voitures d'entraînement`],
+  ["Temps d'entraînement", py.train_ms.toFixed(1) + ' ms', rs.train_ms.toFixed(1) + ' ms',
+    speedup >= 1 ? `Rust ${speedup.toFixed(1)}× plus rapide` : `Python ${(1 / speedup).toFixed(1)}× plus rapide`],
+];
+document.getElementById('kpis').innerHTML = kpis.map(([label, a, b, hint]) => `
+  <div class="card kpi">
+    <div class="label">${label}</div>
+    <div class="row"><span class="tag py">Python</span><span class="val">${a}</span></div>
+    <div class="row"><span class="tag rs">Rust</span><span class="val">${b}</span></div>
+    <div class="hint">${hint}</div>
+  </div>`).join('');
+
+// Courbe de loss
+new Chart(document.getElementById('loss'), {
+  type: 'line',
+  data: {
+    labels: py.loss.map((_, i) => i),
+    datasets: [
+      { label: 'Python', data: py.loss, borderColor: PY, borderWidth: 3, pointRadius: 0 },
+      { label: 'Rust', data: rs.loss, borderColor: RS, borderWidth: 1.5, borderDash: [6, 4], pointRadius: 0 },
+    ],
+  },
+  options: {
+    maintainAspectRatio: false, animation: false, interaction: { mode: 'index', intersect: false },
+    scales: {
+      x: { title: { display: true, text: 'Epoch' }, ticks: { maxTicksLimit: 6 } },
+      y: { type: 'logarithmic', title: { display: true, text: 'MSE' } },
+    },
+  },
+});
+
+// Réel vs prédit
+const all = [...py.test.actual, ...py.test.predicted, ...rs.test.predicted];
+const lo = Math.min(...all), hi = Math.max(...all);
+const pts = r => r.test.actual.map((a, i) => ({ x: a, y: r.test.predicted[i] }));
+new Chart(document.getElementById('scatter'), {
+  type: 'scatter',
+  data: {
+    datasets: [
+      { label: 'Python', data: pts(py), backgroundColor: PY, pointRadius: 6 },
+      { label: 'Rust', data: pts(rs), backgroundColor: RS, pointRadius: 3 },
+      { label: 'Prédiction parfaite', type: 'line', data: [{ x: lo, y: lo }, { x: hi, y: hi }],
+        borderColor: MUTED, borderDash: [4, 4], borderWidth: 1, pointRadius: 0 },
+    ],
+  },
+  options: {
+    maintainAspectRatio: false,
+    scales: {
+      x: { title: { display: true, text: 'Prix réel ($)' } },
+      y: { title: { display: true, text: 'Prix prédit ($)' } },
+    },
+    plugins: { tooltip: { callbacks: { label: c => `${c.dataset.label} : réel ${$(c.parsed.x)} → prédit ${$(c.parsed.y)}` } } },
+  },
+});
+
+// Poids
+const feats = Object.keys(py.weights).sort((a, b) => Math.abs(py.weights[b]) - Math.abs(py.weights[a]));
+new Chart(document.getElementById('weights'), {
+  type: 'bar',
+  data: {
+    labels: feats,
+    datasets: [
+      { label: 'Python', data: feats.map(f => py.weights[f]), backgroundColor: PY },
+      { label: 'Rust', data: feats.map(f => rs.weights[f]), backgroundColor: RS },
+    ],
+  },
+  options: { indexAxis: 'y', maintainAspectRatio: false },
+});
+
+// Tableau
+const rows = py.test.actual.map((a, i) => {
+  const p = py.test.predicted[i], r = rs.test.predicted[i], err = (p - a) / a * 100;
+  return `<tr><td>#${i + 1}</td><td>${$(a)}</td><td style="color:${PY}">${$(p)}</td><td style="color:${RS}">${$(r)}</td>
+    <td class="${Math.abs(err) < 15 ? 'err-good' : 'err-bad'}">${err > 0 ? '+' : ''}${err.toFixed(1)} %</td></tr>`;
+});
+document.getElementById('preds').innerHTML =
+  '<thead><tr><th>Voiture</th><th>Réel</th><th>Python</th><th>Rust</th><th>Écart</th></tr></thead><tbody>' + rows.join('') + '</tbody>';
+
+// ---------- Entraînement en direct ----------
+const FEATS = Object.keys(py.weights);
+const predict = (X, s) => X.map(x => x.reduce((acc, v, j) => acc + v * s.w[j], s.b));
+const mse = (y, p) => y.reduce((a, v, i) => a + (v - p[i]) ** 2, 0) / y.length;
+const r2 = (y, p) => { const m = y.reduce((a, v) => a + v, 0) / y.length;
+  return 1 - mse(y, p) * y.length / y.reduce((a, v) => a + (v - m) ** 2, 0); };
+
+let src = py, frame = 0, playing = true, last = 0, acc = 0;
+const scrub = document.getElementById('scrub');
+const bounds = r => {  // axes fixes pour que le mouvement soit lisible
+  const ps = r.snapshots.flatMap(s => [...predict(r.train.x, s), ...predict(r.test.x, s)]);
+  return [Math.min(0, ...ps), Math.max(hi, ...ps)];
+};
+const [yLo, yHi] = bounds(py);
+const wMax = Math.max(...Object.values(py.weights).map(Math.abs)) * 1.15;
+
+const liveScatter = new Chart(document.getElementById('live-scatter'), {
+  type: 'scatter',
+  data: { datasets: [
+    { label: 'Entraînement', data: [], backgroundColor: 'rgba(139,147,167,.45)', pointRadius: 3 },
+    { label: 'Test', data: [], backgroundColor: PY, pointRadius: 5 },
+    { label: 'Parfait', type: 'line', data: [{ x: 0, y: 0 }, { x: hi, y: hi }], borderColor: MUTED, borderDash: [4, 4], borderWidth: 1, pointRadius: 0 },
+  ] },
+  options: { maintainAspectRatio: false, animation: false,
+    scales: { x: { min: 0, max: Math.ceil(hi / 5000) * 5000, title: { display: true, text: 'Prix réel ($)' } },
+              y: { min: Math.floor(yLo / 5000) * 5000, max: Math.ceil(yHi / 5000) * 5000, title: { display: true, text: 'Prix prédit ($)' } } } },
+});
+const liveLoss = new Chart(document.getElementById('live-loss'), {
+  type: 'line',
+  data: { datasets: [{ label: 'MSE train', data: [], borderColor: PY, borderWidth: 2, pointRadius: 0 }] },
+  options: { maintainAspectRatio: false, animation: false, parsing: false, plugins: { legend: { display: false } },
+    scales: { x: { type: 'logarithmic', min: 1, max: py.loss.length, title: { display: true, text: 'Epoch (échelle log)' } },
+              y: { type: 'logarithmic', min: Math.min(...py.loss) * 0.8, max: py.loss[0] * 1.2, title: { display: true, text: 'MSE' } } } },
+});
+const liveWeights = new Chart(document.getElementById('live-weights'), {
+  type: 'bar',
+  data: { labels: FEATS, datasets: [{ data: [], backgroundColor: PY }] },
+  options: { indexAxis: 'y', maintainAspectRatio: false, animation: false, plugins: { legend: { display: false } },
+    scales: { x: { min: -wMax, max: wMax } } },
+});
+
+function render() {
+  const s = src.snapshots[frame], color = src === py ? PY : RS;
+  const pTrain = predict(src.train.x, s), pTest = predict(src.test.x, s);
+  liveScatter.data.datasets[0].data = src.train.actual.map((a, i) => ({ x: a, y: pTrain[i] }));
+  liveScatter.data.datasets[1].data = src.test.actual.map((a, i) => ({ x: a, y: pTest[i] }));
+  liveScatter.data.datasets[1].backgroundColor = color;
+  liveLoss.data.datasets[0].data = src.loss.slice(0, Math.max(1, s.epoch)).map((v, i) => ({ x: i + 1, y: v }));
+  liveLoss.data.datasets[0].borderColor = color;
+  liveWeights.data.datasets[0].data = s.w;
+  liveWeights.data.datasets[0].backgroundColor = color;
+  [liveScatter, liveLoss, liveWeights].forEach(c => c.update('none'));
+
+  document.getElementById('s-epoch').textContent = `${s.epoch} / ${src.loss.length}`;
+  document.getElementById('s-mse').textContent = Math.round(mse(src.train.actual, pTrain)).toLocaleString('fr-FR');
+  document.getElementById('s-rmse').textContent = $(Math.sqrt(mse(src.test.actual, pTest)));
+  document.getElementById('s-r2').textContent = r2(src.test.actual, pTest).toFixed(4);
+  scrub.value = frame;
+}
+
+const playBtn = document.getElementById('play');
+const setPlaying = p => { playing = p; playBtn.textContent = p ? '⏸ Pause' : '▶ Lecture'; };
+function tick(t) {
+  const step = 30 / +document.getElementById('speed').value;  // ms par image
+  if (playing) {
+    acc += t - last;
+    while (acc >= step && frame < src.snapshots.length - 1) { frame++; acc -= step; }
+    if (frame >= src.snapshots.length - 1) setPlaying(false);
+    render();
+  }
+  last = t;
+  requestAnimationFrame(tick);
+}
+
+scrub.max = py.snapshots.length - 1;
+playBtn.onclick = () => { if (frame >= src.snapshots.length - 1) frame = 0; acc = 0; setPlaying(!playing); };
+document.getElementById('restart').onclick = () => { frame = 0; acc = 0; setPlaying(true); };
+scrub.oninput = () => { setPlaying(false); frame = +scrub.value; render(); };
+document.querySelectorAll('.seg .btn').forEach(b => b.onclick = () => {
+  document.querySelectorAll('.seg .btn').forEach(x => x.classList.toggle('on', x === b));
+  src = DATA[b.dataset.src];
+  playBtn.style.background = playBtn.style.borderColor = src === py ? PY : RS;
+  scrub.style.accentColor = src === py ? PY : RS;
+  render();
+});
+render();
+requestAnimationFrame(t => { last = t; requestAnimationFrame(tick); });
+</script>
+</body>
+</html>
